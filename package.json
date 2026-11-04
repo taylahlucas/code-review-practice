@@ -1,0 +1,33 @@
+{
+  "name": "code-review-practice",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/taylahlucas/code-review-practice#readme",
+  "bugs": {
+    "url": "https://github.com/taylahlucas/code-review-practice/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taylahlucas/code-review-practice.git"
+  },
+  "license": "ISC",
+  "author": "Taylah Lucas",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@types/react": "^19.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}
