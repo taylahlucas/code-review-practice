@@ -37,14 +37,24 @@ interface TradingScreenProps {
 
 const API_URL = "https://api.trading.example.com";
 
+function assetOk(response: Response) {
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`);
+  }
+}
+
 async function getPortfolio(userId: string): Promise<Portfolio> {
   const response = await fetch(`${API_URL}/portfolio/${userId}`);
+
+  assetOk(response);
 
   return response.json();
 }
 
 async function getOrders(userId: string): Promise<Order[]> {
   const response = await fetch(`${API_URL}/orders?userId=${userId}`);
+
+  assetOk(response);
 
   return response.json();
 }
@@ -67,13 +77,17 @@ async function placeOrder(
     }),
   });
 
+  assetOk(response);
+
   return response.json();
 }
 
 async function cancelOrder(orderId: string): Promise<void> {
-  await fetch(`${API_URL}/orders/${orderId}`, {
+  const response = await fetch(`${API_URL}/orders/${orderId}`, {
     method: "DELETE",
   });
+
+  assetOk(response);
 }
 
 // ------------------------------------------
@@ -83,41 +97,90 @@ async function cancelOrder(orderId: string): Promise<void> {
 type PriceListener = (update: PriceUpdate) => void;
 
 class PriceFeed {
+  // The open connection. Null means there is nothing to close.
   private socket: WebSocket | null = null;
-
-  // List of functions that want to be told about each price.
+  // Each function here is called with every valid price update.
   private listeners: PriceListener[] = [];
+  // True while the screen wants prices. Disconnect sets this false so a close does not reconnect.
+  private shouldReconnect = false;
 
-  // Opens the connection, the server sends a message whenever a price changes.
+  // Ask for a connection, and allow a later drop to reconnect.
   connect() {
-    this.socket = new WebSocket("wss://stream.trading.example.com/prices");
+    this.shouldReconnect = true;
+    this.open();
+  }
 
-    // onmessage turns a message from text into an object, then calls every function in listeners with it.
-    // Each object looks like a symbol, a price and a timestamp.
-    this.socket.onmessage = (event) => {
-      const update: PriceUpdate = JSON.parse(event.data);
+  // Replace any current socket with a new one.
+  private open() {
+    if (this.socket) {
+      // Drop the old close handler so closing it below does not open another socket.
+      this.socket.onclose = null;
+      // Close the previous connection. Replacing this.socket alone would leave it open.
+      this.socket.close();
+    }
 
-      this.listeners.forEach((listener) => {
-        listener(update);
-      });
+    // Keep a local reference so this socket can tell itself apart from a newer one.
+    const socket = new WebSocket("wss://stream.trading.example.com/prices");
+    // Save it so disconnect, and the next open, can close this exact connection.
+    this.socket = socket;
+
+    // Run this for each message the server sends.
+    socket.onmessage = (event) => {
+      try {
+        // event.data is text. Parse it into a symbol, price, and timestamp.
+        const update: PriceUpdate = JSON.parse(event.data);
+
+        // Ignore a message that parsed but does not have a symbol and a numeric price.
+        if (
+          typeof update.symbol !== "string" ||
+          typeof update.price !== "number"
+        ) {
+          return;
+        }
+
+        // Pass this update to every subscriber.
+        this.listeners.forEach((listener) => {
+          listener(update);
+        });
+      } catch {
+        // JSON.parse throws on bad text. Catch it so the next message is still handled.
+      }
+    };
+
+    // Run this when the connection closes, including a network drop.
+    socket.onclose = () => {
+      // Stop if a newer socket replaced this one, or the screen closed it on purpose.
+      if (this.socket !== socket || !this.shouldReconnect) {
+        return;
+      }
+
+      // This socket is no longer usable.
+      this.socket = null;
+
+      // Wait a second, then reconnect only if the screen still wants prices.
+      setTimeout(() => {
+        if (this.shouldReconnect) {
+          this.open();
+        }
+      }, 1000);
     };
   }
 
-  // Adds one of the listener functions to the list of listeners
+  // Remember a function and return a way to remove that function later.
   subscribe(listener: PriceListener) {
     this.listeners.push(listener);
 
     return () => {
-      // ISSUE: This does not return a list of filtered items, it builds it and throws it away
-      // this.listeners.filter((item) => item !== listener);
-
-      // FIX: Set the listeners to the filtered array
       this.listeners = this.listeners.filter((item) => item !== listener);
     };
   }
 
+  // Close the feed for good. The following onclose must not reconnect.
   disconnect() {
+    this.shouldReconnect = false;
     this.socket?.close();
+    // Drop the reference so a late onclose sees that this socket is no longer current.
+    this.socket = null;
   }
 }
 
@@ -131,7 +194,12 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
   const [price, setPrice] = useState(0);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [orders, setOrders] = useState<Order[]>([]);
-  const [quantity, setQuantity] = useState(1);
+  // FIX: Keep user quantity typed seperate to the number willing to trade
+  const [quantityInput, setQuantityInput] = useState("1");
+  const quantity = Number(quantityInput);
+  const hasValidQuantity = Number.isInteger(quantity) && quantity > 0;
+  const estimatedCost = hasValidQuantity ? price * quantity : 0;
+
   const [loading, setLoading] = useState(false);
   const [cancellingOrderIds, setCancellingOrderIds] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -141,6 +209,12 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
   // ------------------------------------------
 
   useEffect(() => {
+    // FIX: Prevent loading if userId has changed
+    let ignore = false;
+    setPortfolio(null);
+    setOrders([]);
+    setError("");
+
     // ISSUE: getPortfolio and getOrders returns a promise, so these functions should be awaited
     // getPortfolio(userId).then((data) => {
     //   setPortfolio(data);
@@ -152,16 +226,31 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
 
     // FIX: wrap the asynchronous functions in a function, then call it
     async function loadInitialData() {
-      const [portfolio, orders] = await Promise.all([
-        getPortfolio(userId),
-        getOrders(userId),
-      ]);
+      try {
+        const [nextPortfolio, nextOrders] = await Promise.all([
+          getPortfolio(userId),
+          getOrders(userId),
+        ]);
 
-      setPortfolio(portfolio);
-      setOrders(orders);
+        if (ignore) {
+          return;
+        }
+
+        setPortfolio(nextPortfolio);
+        setOrders(nextOrders);
+      } catch (error) {
+        if (ignore) {
+          return;
+        }
+        setError("Unable to load account");
+      }
     }
-
     loadInitialData();
+
+    return () => {
+      // FIX: Sets ignore to true so that a new useEffect will set it back to false, indicating a new userId is being used
+      ignore = true;
+    };
   }, [userId]);
 
   // ------------------------------------------
@@ -169,6 +258,9 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
   // ------------------------------------------
 
   useEffect(() => {
+    // FIX: Prevents the price from the previous symbol displaying on the screen
+    setPrice(0);
+
     // Connect to the socket
     priceFeed.connect();
 
@@ -180,6 +272,7 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
     //     setPrice(update.price);
     //   }
     // });
+
     // FIX: Assign the subscribe function to an unsubscribe function and call it in the cleanup.
     const unsubscribe = priceFeed.subscribe((update) => {
       // Compares the message's symbol with the symbol this screen is showing.
@@ -204,14 +297,14 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
   //   return price * quantity;
   // }, [price, quantity]);
 
-  // FIX: Add quantity to the dependency array. useMemo is not necessary here, this calculation is cheap.
-  const estimatedCost = price * quantity;
-
   // ------------------------------------------
   // Place order
   // ------------------------------------------
 
   async function handleBuy() {
+    if (!hasValidQuantity) {
+      setError("Enter a quantity of at least 1");
+    }
     setLoading(true);
     setError("");
 
@@ -229,8 +322,10 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
       }
 
       const order = await placeOrder(userId, symbol, quantity);
+      // Calculate the cost
+      const cost = order.price * order.quantity;
 
-      setOrders([order, ...orders]);
+      setOrders((currentOrders) => [order, ...currentOrders]);
 
       // ISSUE: Should not use direct null check ! here as it can throw errors
       // setPortfolio({
@@ -238,9 +333,23 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
       //   availableBalance: portfolio!.availableBalance - estimatedCost,
       // });
 
-      setPortfolio({
-        ...portfolio,
-        availableBalance: portfolio.availableBalance - estimatedCost,
+      setPortfolio((currentPortfolio) => {
+        if (!currentPortfolio || typeof order.price !== "number") {
+          return currentPortfolio;
+        }
+        // Determine how much the portfolio holds
+        const held = currentPortfolio.positions[order.symbol] ?? 0;
+
+        return {
+          ...currentPortfolio,
+          // FIX: Ensure the balance of the portfolio is updated
+          availableBalance: portfolio.availableBalance - cost,
+          positions: {
+            ...currentPortfolio.positions,
+            // FIX: Ensure the quantity of the order is updated
+            [order.symbol]: held + order.quantity,
+          },
+        };
       });
     } catch {
       setError("Unable to place order");
@@ -265,18 +374,39 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
     try {
       await cancelOrder(orderId);
 
-      const updatedOrders = orders.map((order) => {
-        if (order.id === orderId) {
-          return {
-            ...order,
-            status: "CANCELLED" as OrderStatus,
-          };
+      // FIX: Find the order to be cancelled from the list of current orders
+      const orderToCancel = orders.find((order) => order.id === orderId);
+      // FIX: Calculate the cost of the current order to cancel by quantity
+      const cost =
+        orderToCancel && typeof orderToCancel.price === "number"
+          ? orderToCancel.price * orderToCancel.quantity
+          : 0;
+
+      // FIX: Update from the current list so this cancel does not overwrite a newer order.
+      setOrders((currentOrders) =>
+        currentOrders.map((order) =>
+          order.id === orderId ? { ...order, status: "CANCELLED" } : order,
+        ),
+      );
+
+      // FIX: Update the portfolio with the cancelled cost
+      setPortfolio((currentPortfolio) => {
+        if (!currentPortfolio || !orderToCancel) {
+          return currentPortfolio;
         }
 
-        return order;
-      });
+        const held = currentPortfolio.positions[orderToCancel.symbol] ?? 0;
 
-      setOrders(updatedOrders);
+        return {
+          ...currentPortfolio,
+          // FIX: Update the portfolio with the new cost and position quantity
+          availableBalance: currentPortfolio.availableBalance + cost,
+          positions: {
+            ...currentPortfolio.positions,
+            [orderToCancel.symbol]: held - orderToCancel.quantity,
+          },
+        };
+      });
     } catch {
       setError("Unable to cancel order");
     } finally {
@@ -312,7 +442,7 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
           Available balance: £
           {typeof portfolio?.availableBalance === "number"
             ? portfolio.availableBalance.toFixed(2)
-            : "0.00"}
+            : "-"}
         </p>
       </section>
 
@@ -323,13 +453,15 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
           type="number"
           value={quantity}
           onChange={(event) => {
-            setQuantity(Number(event.target.value));
+            setQuantityInput(event.target.value);
           }}
         />
 
-        <p>Estimated cost: £{estimatedCost.toFixed(2)}</p>
+        <p>
+          Estimated cost: £{hasValidQuantity ? estimatedCost.toFixed(2) : "-"}
+        </p>
 
-        <button onClick={handleBuy} disabled={loading}>
+        <button onClick={handleBuy} disabled={loading || !hasValidQuantity}>
           {loading ? "Processing..." : "Buy"}
         </button>
 
@@ -349,10 +481,7 @@ export function TradingScreen({ userId, symbol }: TradingScreenProps) {
             {/* <span>£{order.price.toFixed(2)}</span> */}
             {/* FIX: Check the order price is valid first, otherwise return 0 */}
             <span>
-              £
-              {typeof order.price === "number"
-                ? order.price.toFixed(2)
-                : "0.00"}
+              £{typeof order.price === "number" ? order.price.toFixed(2) : "-"}
             </span>
 
             <span>{order.status}</span>
