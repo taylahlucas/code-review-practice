@@ -33,10 +33,61 @@ interface PortfolioDashboardProps {
 
 const API_URL = "https://api.trading.example.com";
 
-async function fetchPortfolio(portfolioId: string): Promise<Portfolio> {
-  const response = await fetch(`${API_URL}/portfolios/${portfolioId}`);
+// Wrapper for endpoints to handle HTML errors
+async function assertOk(response: Response) {
+  if (!response.ok) {
+    throw new Error(`Request failed ${response.status}`);
+  }
+}
 
-  return response.json();
+function isHolding(value: unknown): value is Holding {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const holding = value as Record<string, unknown>;
+
+  return (
+    typeof holding.symbol === "string" &&
+    typeof holding.name === "string" &&
+    typeof holding.quantity === "number" &&
+    typeof holding.averagePrice === "number" &&
+    typeof holding.currentPrice === "number"
+  );
+}
+
+// We cast as unknown since typescript will not allow you to treat it as "Portfolio" until the shape is proven. Any turns that check off, meaning an incorrect schema would still compile even though it would fail later on.
+function isPortfolio(value: unknown): value is Portfolio {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const portfolio = value as Record<string, unknown>;
+
+  return (
+    typeof portfolio.id === "string" &&
+    typeof portfolio.name === "string" &&
+    Array.isArray(portfolio.holdings) &&
+    portfolio.holdings.every(isHolding)
+  );
+}
+
+async function fetchPortfolio(portfolioId: string): Promise<Portfolio> {
+  // We should use encodeURIComponent here to keep the id as one path segment
+  const response = await fetch(
+    `${API_URL}/portfolios/${encodeURIComponent(portfolioId)}`,
+  );
+
+  assertOk(response);
+
+  const data: unknown = await response.json();
+
+  // Checking the portfolio data is what we expect
+  if (!isPortfolio(data)) {
+    throw new Error("Unexpected portfolio response");
+  }
+
+  return data;
 }
 
 // ------------------------------------------
@@ -45,20 +96,74 @@ async function fetchPortfolio(portfolioId: string): Promise<Portfolio> {
 
 class MarketDataService {
   private socket: WebSocket | null = null;
-
   private listeners: Function[] = [];
+  // Add a reconnect timer to ensure we can connect to the socket again after a drop
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private subscribers = 0;
 
   connect() {
-    if (this.socket) return;
+    this.subscribers += 1;
 
-    this.socket = new WebSocket("wss://stream.trading.example.com/prices");
+    if (this.socket) {
+      return;
+    }
 
-    this.socket.onmessage = (event) => {
-      const update: PriceUpdate = JSON.parse(event.data);
+    this.open();
+  }
 
-      this.listeners.forEach((listener) => {
-        listener(update);
-      });
+  private open() {
+    // Check if the current socket is open first, if so, close it
+    if (this.socket) {
+      // Dropping the onclose handle so calling it doesn't open a new socket
+      this.socket.onclose = null;
+      // Close any previous connection
+      this.socket.close();
+    }
+
+    const socket = new WebSocket("wss://stream.trading.example.com/prices");
+    this.socket = socket;
+
+    // Update listeners on message, ensuring event.data is parsed first
+    socket.onmessage = (event) => {
+      // Wrap in try catch so a bad JSON.parse doesn't crash
+      try {
+        const update: PriceUpdate = JSON.parse(event.data);
+
+        // Check if the update data is valid first
+        if (
+          typeof update.price !== "number" ||
+          typeof update.symbol !== "string"
+        ) {
+          return;
+        }
+
+        this.listeners.forEach((listener) => {
+          listener(update);
+        });
+      } catch {
+        // Fall through bad JSON parsing
+      }
+    };
+
+    socket.onclose = () => {
+      // Check if the current socket is this socket before closing
+      if (this.socket !== socket) {
+        return;
+      }
+
+      // Ensure this socket is no longer used
+      this.socket = null;
+
+      // Reconnect the socket after closing
+      this.reconnectTimer = setTimeout(() => {
+        // onclose waits one second then calls open(), open() closes whatever socket is current and opens a new one. If a second dashboard mounts in that second, connect() sees no socket and opens one immediately. We should clear the timer at the start of open() and skip the retry when nothing is listening.
+        this.reconnectTimer = null;
+
+        if (this.subscribers === 0) {
+          return;
+        }
+        this.open();
+      }, 1000);
     };
   }
 
@@ -66,12 +171,26 @@ class MarketDataService {
     this.listeners.push(listener);
 
     return () => {
-      this.listeners.filter((item) => item !== listener);
+      // Ensure the existing listeners is actually updated
+      this.listeners = this.listeners.filter((item) => item !== listener);
     };
   }
 
   disconnect() {
+    this.subscribers -= 1;
+
+    if (this.subscribers > 0) {
+      return;
+    }
+
+    // Cancels any retry that is already waiting
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     this.socket?.close();
+    // Drop the reference so a late onclose knows that this socket is no longer current
     this.socket = null;
   }
 }
@@ -84,15 +203,11 @@ const marketData = new MarketDataService();
 
 export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
-
   const [prices, setPrices] = useState<Record<string, number>>({});
-
   const [search, setSearch] = useState("");
-
   const [sortBy, setSortBy] = useState("value");
-
-  const [loading, setLoading] = useState(false);
-
+  // Loading should start as true while the initial portfolio is loading.
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   // ----------------------------------------
@@ -100,25 +215,45 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
   // ----------------------------------------
 
   useEffect(() => {
+    let ignore = false;
+    // Ensure state is reset on new use effect, so we don't retrieve a previous users data
+    setPortfolio(null);
+    setSearch("");
+    setError("");
     setLoading(true);
 
-    fetchPortfolio(portfolioId)
-      .then((data) => {
-        setPortfolio(data);
-        setPrices(
-          Object.fromEntries(
-            data.holdings.map((holding) => [
-              holding.symbol,
-              holding.currentPrice,
-            ]),
-          ),
-        );
-      })
-      .catch(() => {
-        setError("Unable to load portfolio");
-      });
+    const loadInitialData = async () => {
+      try {
+        const response = await fetchPortfolio(portfolioId);
 
-    setLoading(false);
+        // The ignore needs to be after we fetch the portfolio, so if we receive a response for portfolio A which arrives after you switch to portfolio B, it will be ignored.
+        if (ignore) return;
+
+        setPortfolio(response);
+        // Only update prices that have changed, rather than remapping the whole set
+        setPrices((previous) => {
+          const next: Record<string, number> = {};
+
+          for (const holding of response.holdings) {
+            next[holding.symbol] =
+              previous[holding.symbol] ?? holding.currentPrice;
+          }
+
+          return next;
+        });
+      } catch {
+        if (!ignore) setError("Unable to load portfolio");
+      } finally {
+        if (!ignore) setLoading(false);
+      }
+    };
+
+    loadInitialData();
+
+    // When portfolioId changes, this runs and ignore is set to true
+    return () => {
+      ignore = true;
+    };
   }, [portfolioId]);
 
   // ----------------------------------------
@@ -128,14 +263,23 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
   useEffect(() => {
     marketData.connect();
 
-    marketData.subscribe((update: PriceUpdate) => {
-      setPrices((previous) => ({
-        ...previous,
-        [update.symbol]: update.price,
-      }));
+    // Need to make sure we unsubscribe this listener aswell
+    const unsubscribe = marketData.subscribe((update: PriceUpdate) => {
+      setPrices((previous) => {
+        // Skip symbols we don't hold. Returning the same object avoids a re-render.
+        if (!(update.symbol in previous)) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          [update.symbol]: update.price,
+        };
+      });
     });
 
     return () => {
+      unsubscribe();
       marketData.disconnect();
     };
   }, []);
@@ -148,11 +292,13 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
     if (!portfolio) return 0;
 
     return portfolio.holdings.reduce((total, holding) => {
-      const currentPrice = prices[holding.symbol] || holding.currentPrice;
+      // Need to use ?? here instead of || , since || will fail for 0
+      const currentPrice = prices[holding.symbol] ?? holding.currentPrice;
 
       return total + currentPrice * holding.quantity;
     }, 0);
-  }, [portfolio]);
+    // Since prices is also read, we should depend on that too
+  }, [portfolio, prices]);
 
   // ----------------------------------------
   // Calculate profit/loss
@@ -162,7 +308,7 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
     if (!portfolio) return 0;
 
     return portfolio.holdings.reduce((total, holding) => {
-      const currentPrice = prices[holding.symbol] || holding.currentPrice;
+      const currentPrice = prices[holding.symbol] ?? holding.currentPrice;
 
       const profit = (currentPrice - holding.averagePrice) * holding.quantity;
 
@@ -176,9 +322,12 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
 
   const filteredHoldings = useMemo(() => {
     if (!portfolio) return [];
+    const query = search.toLowerCase();
 
-    return portfolio.holdings.filter((holding) =>
-      holding.name.toLowerCase().includes(search.toLowerCase()),
+    return portfolio.holdings.filter(
+      (holding) =>
+        holding.name.toLowerCase().includes(query) ||
+        holding.symbol.toLowerCase().includes(query),
     );
   }, [portfolio, search]);
 
@@ -187,20 +336,25 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
   // ----------------------------------------
 
   const sortedHoldings = useMemo(() => {
+    const priceOf = (holding: Holding) =>
+      prices[holding.symbol] ?? holding.currentPrice;
+
     return [...filteredHoldings].sort((a, b) => {
       if (sortBy === "value") {
-        return b.currentPrice * b.quantity - a.currentPrice * a.quantity;
+        return priceOf(b) * b.quantity - priceOf(a) * a.quantity;
       }
 
       if (sortBy === "profit") {
-        return (
-          b.currentPrice - b.averagePrice - (a.currentPrice - a.averagePrice)
-        );
+        const profit = (holding: Holding) =>
+          (priceOf(holding) - holding.averagePrice) * holding.quantity;
+
+        return profit(b) - profit(a);
       }
 
       return 0;
     });
-  }, [filteredHoldings, sortBy]);
+    // Need to depend on prices here too
+  }, [filteredHoldings, sortBy, prices]);
 
   // ----------------------------------------
   // Render
@@ -246,7 +400,7 @@ export function PortfolioDashboard({ portfolioId }: PortfolioDashboardProps) {
 
       <section>
         {sortedHoldings.map((holding) => {
-          const currentPrice = prices[holding.symbol] || holding.currentPrice;
+          const currentPrice = prices[holding.symbol] ?? holding.currentPrice;
 
           const profit =
             (currentPrice - holding.averagePrice) * holding.quantity;
